@@ -132,8 +132,8 @@ class AmyloidEnv(gym.Env):
 # --- Example of using the environment ---
 if __name__ == "__main__":
     # Replace with the actual paths to your AF2 prediction and experimental structure.
-    af2_path = "project_directory/sample1/AF2/af_prediction.pdb"
-    exp_path = "project_directory/sample1/Experimental/experimental.pdb"
+    af2_path = "data\Sample 1\AF2\8olq_AF2.cif"
+    exp_path = "data\Sample 1\Experimental\8olq.cif"
     
     env = AmyloidEnv(af2_path, exp_path, max_steps=50)
     
