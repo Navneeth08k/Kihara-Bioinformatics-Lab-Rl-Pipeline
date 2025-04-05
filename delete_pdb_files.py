@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import os
 import glob
 
@@ -27,8 +29,20 @@ def find_and_delete_pdb_files():
     # Get the current directory where the script is run
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # Find all sample folders
-    sample_dirs = glob.glob(os.path.join(script_dir, "Sample *"))
+    # Path to the data directory
+    data_dir = os.path.join(script_dir, "data")
+    
+    # Check if data directory exists
+    if not os.path.exists(data_dir):
+        print(f"Error: Data directory not found at {data_dir}")
+        return
+        
+    # Find all sample folders within the data directory
+    sample_dirs = glob.glob(os.path.join(data_dir, "Sample *"))
+    
+    if not sample_dirs:
+        print(f"No Sample folders found in {data_dir}")
+        return
     
     # Initialize counters
     total_files = 0
