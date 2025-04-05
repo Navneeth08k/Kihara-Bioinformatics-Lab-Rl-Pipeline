@@ -1,0 +1,3 @@
+Biopython
+gymnasium
+numpy
