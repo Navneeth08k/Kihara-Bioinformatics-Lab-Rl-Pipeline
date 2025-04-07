@@ -106,17 +106,33 @@ class AmyloidEnv(gym.Env):
         self.max_steps = max_steps
         self.current_step = 0
         
-        self.state = load_structure(self.af2_pdb_path)
-        self.state_dim = self.state['phi_psi'].shape[0]
+        # Load structures
+        self.af2_state = load_structure(self.af2_pdb_path)
+        self.exp_state = load_structure(self.exp_pdb_path)
         
+        # Find the minimum length of phi/psi angles between AF2 and experimental
+        af2_phi_psi_len = len(self.af2_state['phi_psi'])
+        exp_phi_psi_len = len(self.exp_state['phi_psi'])
+        self.min_phi_psi_len = min(af2_phi_psi_len, exp_phi_psi_len)
+        
+        # Truncate both states to the minimum length
+        self.af2_state['phi_psi'] = self.af2_state['phi_psi'][:self.min_phi_psi_len]
+        self.exp_state['phi_psi'] = self.exp_state['phi_psi'][:self.min_phi_psi_len]
+        
+        # Initialize the current state
+        self.state = self.af2_state.copy()
+        self.state_dim = self.min_phi_psi_len
+        
+        # Define action and observation spaces
         self.action_space = spaces.Box(low=-5.0, high=5.0, shape=(self.state_dim,), dtype=np.float32)
         self.observation_space = spaces.Box(low=-180, high=180, shape=(self.state_dim,), dtype=np.float32)
         
-        self.target_state = load_structure(self.exp_pdb_path)
+        # Set target state
+        self.target_state = self.exp_state
     
     def reset(self):
         self.current_step = 0
-        self.state = load_structure(self.af2_pdb_path)
+        self.state = self.af2_state.copy()
         return self.state['phi_psi']
     
     def step(self, action):
@@ -133,6 +149,7 @@ class AmyloidEnv(gym.Env):
             "reward": reward
         }
 
+        # Optional debug log
         print(f"[Step {self.current_step}] Reward: {reward:.3f}, RMSD: {info['rmsd']:.3f}, Energy: {info['energy']:.2f}")
         
         return self.state['phi_psi'], reward, done, info
@@ -246,17 +263,40 @@ def test_environment_on_sample(af2_path, exp_path, max_steps=10):
     Creates an environment for a given sample and runs a test episode.
     """
     print(f"\nTesting environment for sample:\n AF2: {af2_path}\n EXP: {exp_path}")
-    env = AmyloidEnv(af2_path, exp_path, max_steps=max_steps)
-    state = env.reset()
-    print("Initial state (first 10 angles):", state[:10])
-    done = False
-    step_count = 0
-    while not done:
-        action = env.action_space.sample()  # Replace with policy action later
-        state, reward, done, info = env.step(action)
-        step_count += 1
-        print(f"Step {step_count}: Reward={reward:.3f}, RMSD={info['rmsd']:.3f}, Energy={info['energy']:.2f}")
-    env.render()
+    
+    try:
+        # Load structures first to check for compatibility
+        af2_features = load_structure(af2_path)
+        exp_features = load_structure(exp_path)
+        
+        af2_phi_psi_len = len(af2_features['phi_psi'])
+        exp_phi_psi_len = len(exp_features['phi_psi'])
+        min_len = min(af2_phi_psi_len, exp_phi_psi_len)
+        
+        print(f"AF2 structure has {af2_phi_psi_len} phi/psi angles")
+        print(f"Experimental structure has {exp_phi_psi_len} phi/psi angles")
+        print(f"Using the first {min_len} angles for comparison")
+        
+        # Create and test the environment
+        env = AmyloidEnv(af2_path, exp_path, max_steps=max_steps)
+        state = env.reset()
+        print("Initial state (first 10 angles):", state[:10])
+        
+        done = False
+        step_count = 0
+        while not done and step_count < max_steps:
+            action = env.action_space.sample()  # Replace with policy action later
+            state, reward, done, info = env.step(action)
+            step_count += 1
+            print(f"Step {step_count}: Reward={reward:.3f}, RMSD={info['rmsd']:.3f}, Energy={info['energy']:.2f}")
+        
+        env.render()
+        return True
+    except Exception as e:
+        print(f"Error testing environment: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 if __name__ == "__main__":
     print("Starting protein feature extraction...")
