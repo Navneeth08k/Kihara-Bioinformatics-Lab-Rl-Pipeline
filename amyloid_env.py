@@ -1,55 +1,45 @@
 import gymnasium as gym
 from gymnasium import spaces
+from Bio.PDB import MMCIFParser, PPBuilder
 import numpy as np
+import os
 
-# --- Placeholder Functions ---
-def load_structure(pdb_path):
+def load_structure(cif_path):
     """
-    Loads a PDB or mmCIF file and returns a numpy array representing dihedral angles.
-    In practice, you might extract real dihedral angles using a tool like BioPython or PyRosetta.
-    Here we simulate with a vector of 100 angles (degrees).
+    Loads a CIF file and returns a vector of phi/psi angles (in degrees).
+    Only uses BioPython's MMCIFParser and assumes one chain.
     """
-    # Simulated extraction: Replace with actual parsing later.
-    return np.random.uniform(-180, 180, size=(100,))
+    parser = MMCIFParser(QUIET=True)
+    structure = parser.get_structure("protein", cif_path)
+    
+    model = structure[0]
+    chain = next(model.get_chains())  # You can change this to select a specific chain if needed
+    
+    ppb = PPBuilder()
+    phi_psi_angles = []
+    
+    for pp in ppb.build_peptides(chain):
+        phi_psi = pp.get_phi_psi_list()
+        for phi, psi in phi_psi:
+            if phi is not None and psi is not None:
+                phi_psi_angles.extend([np.degrees(phi), np.degrees(psi)])
+    
+    return np.array(phi_psi_angles, dtype=np.float32)
 
 def apply_action(state, action):
-    """
-    Applies an action to the state.
-    Here the action is assumed to be a vector of small angle adjustments.
-    """
     new_state = state + action
     return np.clip(new_state, -180, 180)
 
 def compute_energy(state):
-    """
-    Computes a simplified energy score.
-    Replace with a proper energy function (e.g., from OpenMM, PyRosetta, or a force field).
-    """
-    return np.sum(np.abs(state))  # Placeholder: lower is better
+    return np.sum(np.abs(state))
 
 def compute_rmsd(state, target_state):
-    """
-    Computes a dummy RMSD between the current state and the target (experimental) state.
-    """
     return np.sqrt(np.mean((state - target_state) ** 2))
 
 def compute_sasa(state):
-    """
-    Placeholder function for computing solvent-accessible surface area (SASA).
-    In practice, use MDTraj, FreeSASA, or PyRosetta.
-    Here we simulate that lower SASA (for hydrophobic regions) is better.
-    """
-    return np.sum(np.abs(state)) * 0.01  # Placeholder scaling
+    return np.sum(np.abs(state)) * 0.01
 
-# --- Custom Gym Environment ---
 class AmyloidEnv(gym.Env):
-    """
-    A custom environment for refining protein structures (e.g., beta-amyloids) using RL.
-    
-    The state is represented by a vector of dihedral angles extracted from the AF2 predicted structure.
-    The action space allows small perturbations to these angles.
-    The reward function combines energy, RMSD (to the experimental structure), SASA, and optional bonuses/penalties.
-    """
     metadata = {"render.modes": ["human"]}
     
     def __init__(self, af2_pdb_path, exp_pdb_path, max_steps=50):
@@ -59,57 +49,46 @@ class AmyloidEnv(gym.Env):
         self.max_steps = max_steps
         self.current_step = 0
         
-        # Load the initial AF2 predicted structure (as dihedral angles)
         self.state = load_structure(self.af2_pdb_path)
         self.state_dim = self.state.shape[0]
         
-        # Define action: small changes to each dihedral angle (e.g., ±5 degrees)
         self.action_space = spaces.Box(low=-5.0, high=5.0, shape=(self.state_dim,), dtype=np.float32)
-        # Observation space: dihedral angles typically range from -180 to 180
         self.observation_space = spaces.Box(low=-180, high=180, shape=(self.state_dim,), dtype=np.float32)
         
-        # Load the experimental structure as a target state (placeholder)
         self.target_state = load_structure(self.exp_pdb_path)
     
     def reset(self):
-        """Resets the environment to the initial state and returns the initial observation."""
         self.current_step = 0
         self.state = load_structure(self.af2_pdb_path)
         return self.state
     
     def step(self, action):
-        """Applies the action, updates the state, and computes the reward."""
-        # Apply the action to update the state (simulate structural refinement)
         self.state = apply_action(self.state, action)
         self.current_step += 1
-        
-        # Compute reward from multiple components
+
         reward = self._compute_reward(self.state)
-        
-        # Define done: for example, end after max_steps or if convergence is reached
         done = self.current_step >= self.max_steps or self._has_converged(self.state)
-        info = {}  # Additional info can be returned here if needed
+        info = {
+            "step": self.current_step,
+            "energy": compute_energy(self.state),
+            "rmsd": compute_rmsd(self.state, self.target_state),
+            "sasa": compute_sasa(self.state),
+            "reward": reward
+        }
+
+        # Optional debug log
+        print(f"[Step {self.current_step}] Reward: {reward:.3f}, RMSD: {info['rmsd']:.3f}, Energy: {info['energy']:.2f}")
         
         return self.state, reward, done, info
-    
+
     def _compute_reward(self, state):
-        """
-        Combines several components into a single scalar reward:
-          - Energy (minimize)
-          - RMSD to experimental target (minimize)
-          - SASA for hydrophobic burial (minimize)
-          - Optional bonus for beta-sheet content, penalty for steric clashes, etc.
-        Weights can be tuned to emphasize the desired behavior.
-        """
         energy = compute_energy(state)
         rmsd = compute_rmsd(state, self.target_state)
         sasa = compute_sasa(state)
         
-        # Optional terms: these are placeholders for additional structural criteria.
-        beta_bonus = np.random.uniform(-1, 1)  # Replace with actual beta-sheet measure
-        clash_penalty = np.random.uniform(0, 1)  # Replace with clash-detection method
+        beta_bonus = np.random.uniform(-1, 1)
+        clash_penalty = np.random.uniform(0, 1)
         
-        # Combine with weights (example weights; adjust as needed)
         total_reward = (0.4 * (-energy) + 
                         0.3 * (-rmsd) +
                         0.2 * (-sasa) +
@@ -118,32 +97,55 @@ class AmyloidEnv(gym.Env):
         return total_reward
     
     def _has_converged(self, state):
-        """
-        Checks if the structure has converged.
-        This can be based on minimal changes between steps or a threshold in RMSD.
-        Here, we use a placeholder that always returns False.
-        """
         return False
     
     def render(self, mode="human"):
-        """Renders the current state of the environment."""
         print(f"Step {self.current_step} - Energy: {compute_energy(self.state):.2f}, RMSD: {compute_rmsd(self.state, self.target_state):.2f}")
 
-# --- Example of using the environment ---
+# --- Helper to find all sample paths ---
+def get_all_samples(base_dir="data"):
+    """
+    Scans the data directory and returns a list of (AF2_path, EXP_path) tuples.
+    Assumes structure: data/Sample N/AF2/{ID}_AF2.cif and Experimental/{ID}.cif
+    """
+    samples = []
+    for sample_folder in os.listdir(base_dir):
+        sample_path = os.path.join(base_dir, sample_folder)
+        if not os.path.isdir(sample_path):
+            continue
+        try:
+            sample_id = sample_folder.split(" ")[1]  # Extract number (e.g., "1" from "Sample 1")
+            af2_dir = os.path.join(sample_path, "AF2")
+            exp_dir = os.path.join(sample_path, "Experimental")
+            af2_file = next(f for f in os.listdir(af2_dir) if f.endswith("_AF2.cif"))
+            exp_file = next(f for f in os.listdir(exp_dir) if f.endswith(".cif") and not f.endswith("_AF2.cif"))
+            af2_path = os.path.join(af2_dir, af2_file)
+            exp_path = os.path.join(exp_dir, exp_file)
+            samples.append((af2_path, exp_path))
+        except Exception as e:
+            print(f"Skipping {sample_folder}: {e}")
+    return samples
+
+# --- Run Test on All Samples ---
 if __name__ == "__main__":
-    # Replace with the actual paths to your AF2 prediction and experimental structure.
-    af2_path = "data\Sample 1\AF2\8olq_AF2.cif"
-    exp_path = "data\Sample 1\Experimental\8olq.cif"
-    
-    env = AmyloidEnv(af2_path, exp_path, max_steps=50)
-    
-    obs = env.reset()
-    print("Initial observation (first 5 angles):", obs[:5])
-    
-    # Sample a random action and take a step in the environment
-    action = env.action_space.sample()
-    next_obs, reward, done, info = env.step(action)
-    
-    print("Next observation (first 5 angles):", next_obs[:5])
-    print("Reward:", reward)
-    env.render()
+    sample_pairs = get_all_samples("data")
+    print(f"Found {len(sample_pairs)} samples.")
+
+    for i, (af2_path, exp_path) in enumerate(sample_pairs):
+        print(f"\n--- Sample {i+1} ---")
+        print("AF2:", af2_path)
+        print("EXP:", exp_path)
+        try:
+            af2_angles = load_structure(af2_path)
+            exp_angles = load_structure(exp_path)
+            print("AF2 angles shape:", af2_angles.shape)
+            print("EXP angles shape:", exp_angles.shape)
+            env = AmyloidEnv(af2_path, exp_path)
+            obs = env.reset()
+            action = env.action_space.sample()
+            next_obs, reward, done, info = env.step(action)
+            print("Next obs (first 5 angles):", next_obs[:5])
+            print("Reward:", reward)
+            env.render()
+        except Exception as e:
+            print(f"Error with sample {i+1}: {e}")
