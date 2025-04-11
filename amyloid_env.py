@@ -11,6 +11,7 @@ import tempfile
 import csv
 import glob
 import freesasa
+from rebuild_structure import rebuild_structure_from_angles
 
 ### Data Extraction and Feature Calculation
 
@@ -360,24 +361,16 @@ def save_detailed_angles(af2_files):
                 print(f"Error saving angles for {file_path}: {e}")
     print(f"Detailed angles saved to {angles_file}")
 
-def test_environment_on_sample(af2_path, exp_path, max_steps=10):
+def test_environment_on_sample(af2_path, exp_path, max_steps=10, output_dir="refined_outputs"):
     """
-    Creates an environment for a given sample and runs a test episode, printing details (including SASA) at each step.
+    Creates an environment for a given sample, runs a test episode,
+    saves the refined phi/psi angles to CSV, and rebuilds the 3D structure.
     """
     print(f"\nTesting environment for sample:\n AF2: {af2_path}\n EXP: {exp_path}")
-    
+    os.makedirs(output_dir, exist_ok=True)
+
     try:
-        # Load structures to report number of phi/ψ angles
-        af2_features = load_structure(af2_path)
-        exp_features = load_structure(exp_path)
-        af2_phi_psi_len = len(af2_features['phi_psi'])
-        exp_phi_psi_len = len(exp_features['phi_psi'])
-        min_len = min(af2_phi_psi_len, exp_phi_psi_len)
-        print(f"AF2 structure has {af2_phi_psi_len} phi/ψ angles")
-        print(f"Experimental structure has {exp_phi_psi_len} phi/ψ angles")
-        print(f"Using the first {min_len} angles for comparison")
-        
-        # Create and test the environment
+        # Load structures and setup environment
         env = AmyloidEnv(af2_path, exp_path, max_steps=max_steps)
         state = env.reset()
         print("Initial state (first 10 angles):", state[:10])
@@ -385,15 +378,33 @@ def test_environment_on_sample(af2_path, exp_path, max_steps=10):
         done = False
         step_count = 0
         while not done and step_count < max_steps:
-            action = env.action_space.sample()  # Replace with learned policy later
+            action = env.action_space.sample()  # Later: use learned PPO policy here
             state, reward, done, info = env.step(action)
             step_count += 1
-            print(f"Step {step_count}: Reward={reward:.3f}, RMSD={info['rmsd']:.3f}, Energy={info['energy']:.2f}, SASA={info['sasa']:.2f}")
-        
+
+        # === Save final phi/psi angles to CSV ===
+        refined_angles = state  # this is just the phi/psi vector
+        sample_name = os.path.splitext(os.path.basename(af2_path))[0]
+        angle_csv = os.path.join(output_dir, f"{sample_name}_refined_angles.csv")
+
+        with open(angle_csv, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Residue_Index", "Phi", "Psi"])
+            for i in range(0, len(refined_angles), 2):
+                if i + 1 < len(refined_angles):
+                    writer.writerow([i // 2 + 1, refined_angles[i], refined_angles[i + 1]])
+        print(f"✅ Saved refined phi/psi angles to: {angle_csv}")
+
+        # === Rebuild 3D structure ===
+        output_pdb_path = os.path.join(output_dir, f"{sample_name}_reconstructed.pdb")
+        rebuild_structure_from_angles(af2_path, refined_angles, output_pdb_path)
+        print(f"✅ Reconstructed structure saved to: {output_pdb_path}")
+
         env.render()
         return True
+
     except Exception as e:
-        print(f"Error testing environment: {str(e)}")
+        print(f"❌ Error testing environment: {str(e)}")
         import traceback
         traceback.print_exc()
         return False
