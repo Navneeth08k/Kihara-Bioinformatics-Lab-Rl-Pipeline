@@ -492,7 +492,7 @@ def main():
     )
     
     model = PPO("MlpPolicy", vec_env, verbose=1, learning_rate=3e-4, clip_range=0.2)
-    total_timesteps = 1000
+    total_timesteps = 1
     model.learn(total_timesteps=total_timesteps, callback=[checkpoint_callback, eval_callback])
     
     model.save("ppo_amyloid_final")

@@ -1,0 +1,11 @@
+Sample,File,Num_Phi_Psi,Num_Atoms,Num_Residues,Avg_B_Factor,Avg_Hydrophobicity,Total_SASA
+Sample 1,8olq_AF2.cif,80,318,40,32.87,0.20,4000.00
+Sample 10,7yat.cif,46,172,23,30.07,0.46,2300.00
+Sample 2,8ot3.cif,76,306,38,74.72,0.06,3800.00
+Sample 3,6cu8.cif,276,1013,138,55.90,-0.40,13800.00
+Sample 4,5aef_AF2.cif,52,198,26,65.09,1.09,2600.00
+Sample 5,5o3l_AF2.cif,142,557,71,24.31,-0.55,7100.00
+Sample 6,7qv6_AF2.cif,30,126,15,57.22,1.05,1500.00
+Sample 7,6gk3_AF2.cif,124,539,62,65.66,-0.49,6200.00
+Sample 8,7vzf.cif,304,1118,152,84.70,-0.34,15200.00
+Sample 9,7q64.cif,76,283,38,31.00,-0.35,3800.00
