@@ -1,39 +1,48 @@
-from Bio.PDB import PDBParser, PDBIO, Model, Chain
-from Bio.PDB.StructureBuilder import StructureBuilder
-import numpy as np
 import os
+import numpy as np
+from Bio.PDB import PDBParser, PDBIO, Chain
+from Bio.PDB.StructureBuilder import StructureBuilder
 
-INPUT_PDB = "inference_outputs/7yat_reconstructed_minimized.pdb"
-OUTPUT_PDB = "inference_outputs/7yat_fibril_multimer.pdb"
-NUM_CHAINS = 24
-TRANSLATION_Z = 4.7  # Angstroms, typical inter-sheet spacing
+def main(num_chains=24):
+    OUTPUT_DIR = "inference_outputs"
+    TRANSLATION_Z = 4.7  # Å — inter-sheet spacing
 
-parser = PDBParser(QUIET=True)
-structure = parser.get_structure("monomer", INPUT_PDB)
-monomer_chain = list(structure[0].get_chains())[0]
+    # Find latest minimized structure
+    pdb_files = sorted([f for f in os.listdir(OUTPUT_DIR) if f.endswith("_reconstructed_minimized.pdb")])
+    if not pdb_files:
+        raise FileNotFoundError("❌ No minimized PDB found in inference_outputs!")
 
-# Create a new structure
-builder = StructureBuilder()
-builder.init_structure("fibril")
-builder.init_model(0)
+    INPUT_PDB = os.path.join(OUTPUT_DIR, pdb_files[-1])
+    basename = pdb_files[-1].replace("_reconstructed_minimized.pdb", "")
+    OUTPUT_PDB = os.path.join(OUTPUT_DIR, f"{basename}_fibril_multimer.pdb")
 
-for i in range(NUM_CHAINS):
-    # Deep copy the chain
-    new_chain = Chain.Chain(chr(65 + i))  # Chain IDs A, B, C...
-    for residue in monomer_chain:
-        new_residue = residue.copy()
-        for atom in new_residue:
-            coord = atom.get_coord()
-            coord[2] += i * TRANSLATION_Z  # Shift along Z-axis
-            atom.set_coord(coord)
-        new_chain.add(new_residue)
-    
-    builder.structure[0].add(new_chain)
+    # Parse and copy monomer
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("monomer", INPUT_PDB)
+    monomer_chain = list(structure[0].get_chains())[0]
 
-# Save the multimer
-io = PDBIO()
-io.set_structure(builder.get_structure())
-io.save(OUTPUT_PDB)
+    # Build multimer structure
+    builder = StructureBuilder()
+    builder.init_structure("fibril")
+    builder.init_model(0)
 
-print(f"✅ Fibril multimer saved: {OUTPUT_PDB}")
+    for i in range(num_chains):
+        new_chain = Chain.Chain(chr(65 + i))  # A, B, C...
+        for residue in monomer_chain:
+            new_residue = residue.copy()
+            for atom in new_residue:
+                coord = atom.get_coord()
+                coord[2] += i * TRANSLATION_Z
+                atom.set_coord(coord)
+            new_chain.add(new_residue)
+        builder.structure[0].add(new_chain)
 
+    # Save result
+    io = PDBIO()
+    io.set_structure(builder.get_structure())
+    io.save(OUTPUT_PDB)
+    print(f"✅ Fibril multimer saved: {OUTPUT_PDB}")
+
+# Prevent auto-running
+if __name__ == "__main__":
+    main()
