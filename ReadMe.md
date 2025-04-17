@@ -1,7 +1,8 @@
 # RL Beta Amyloid Refinement
 
-## Google Drive Folder Link
+## Google Drive Folder Link and Colab Notebook
 https://drive.google.com/drive/folders/16_fQiZGjH3lXOmqZYGQq4EQGG4tykMFg?usp=drive_link
+https://colab.research.google.com/drive/16rcgjxeV6LZ8aO0pEZUUi_mU2ZfyoX-n?usp=sharing
 
 ## Overview
 This project implements a reinforcement learning environment for the refinement of beta amyloid structures using the Gymnasium framework. The environment simulates the manipulation of phi/psi angles of protein structures to optimize their conformation based on energy, RMSD (Root Mean Square Deviation), and SASA (Solvent Accessible Surface Area).
