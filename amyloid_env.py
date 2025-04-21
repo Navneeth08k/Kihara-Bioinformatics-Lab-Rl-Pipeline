@@ -24,33 +24,74 @@ def pad_phi_psi(vec, fixed_dim):
 # structure loader – now with real SASA
 # ------------------------------------------------------------------
 # ---------- helper for real SASA (patched) ------------------------------
+# amyloid_env.py  –  replace ONLY this helper
+# ----------------------------------------------------------------------
+#  Robust per‑residue SASA extractor  – works with every FreeSASA layout
+# ----------------------------------------------------------------------
 def _sasa_per_residue(structure):
+    """
+    Return numpy array of SASA (Å²) for every amino‑acid residue in the
+    *same order* Bio.PDB iterates over the chain.
+    Compatible with:
+      • "A:18:ARG"  (≤2.1)
+      • ResidueId(...) (2.2–2.4)
+      • {'A': {'18': ResidueArea, ...}}  (your build)
+    """
+    import io, tempfile, re, freesasa
+    from Bio.PDB import PDBIO, is_aa
+
     chain = next(structure[0].get_chains())
 
-    # ---- write chain to an in‑memory string ----
-    pdb_buf = io.StringIO()
-    io_writer = PDBIO()
-    io_writer.set_structure(chain)
-    io_writer.save(pdb_buf)
-    pdb_text = pdb_buf.getvalue()
+    # ---- write chain to temp PDB -------------------------------------
+    buf = io.StringIO()
+    writer = PDBIO()
+    writer.set_structure(chain)
+    writer.save(buf)
 
-    # ---- FreeSASA needs a filename, so use a temp file ----
     with tempfile.NamedTemporaryFile("w+", suffix=".pdb") as fh:
-        fh.write(pdb_text)
-        fh.flush()                        # make sure contents hit disk
+        fh.write(buf.getvalue())
+        fh.flush()
         fs_struct = freesasa.Structure(fh.name)
+        fs_res    = freesasa.calc(fs_struct).residueAreas()
 
-    result = freesasa.calc(fs_struct)
-    areas  = result.residueAreas()
+    # ---- flatten any layout to (chain, resSeq) -> total --------------
+    sasa = {}
+    def add(chain_id, res_seq, area):
+      sasa[(chain_id, int(res_seq))] = getattr(area, "total", 0.0)
 
-    sasa_list = []
+
+    # case 1: nested dict  {'A': {'18': ResidueArea}}
+    if isinstance(next(iter(fs_res.keys())), str) and \
+       isinstance(next(iter(fs_res.values())), dict):
+        for ch, inner in fs_res.items():
+            for seq, area in inner.items():
+                add(ch, seq, area)
+
+    # case 2: flat "A:18:ARG"
+    elif isinstance(next(iter(fs_res.keys())), str):
+        for key, area in fs_res.items():
+            parts = key.split(":")
+            if len(parts) == 3:
+                ch, seq, _ = parts
+                add(ch, seq, area)
+
+    # case 3: ResidueId object
+    else:
+        for rid, area in fs_res.items():
+            ch  = getattr(rid, "chain", None) or getattr(rid, "chainLabel")()
+            seq = getattr(rid, "number", None) or getattr(rid, "resNumber")()
+            add(ch, seq, area)
+
+    # ---- vector in Bio‑PDB residue order -----------------------------
+    vec = []
     for res in chain:
-        if not is_aa(res):
-            continue
-        key = (chain.id, res.get_resname(), res.id[1])
-        sasa_list.append(areas.get(key, {}).get("total", 0.0))
+        if is_aa(res):
+            vec.append(sasa.get((chain.id, res.id[1]), 0.0))
 
-    return np.array(sasa_list, dtype=np.float32)
+    return np.array(vec, dtype=np.float32)
+
+
+
 
 
 def load_structure(cif_path):
@@ -201,7 +242,14 @@ class AmyloidEnv(gym.Env):
         rmsd_val = None if self.i_mode else compute_rmsd(self.state, self.target)
         print(f"[{self.current_step:02d}] E={compute_energy(self.state):.1f} "
               f"RMSD={rmsd_val} hydS={hydS:.1f} polS={polS:.1f} R={reward:+.2f}")
-        return self.state["phi_psi"], reward, False, trunc, {}
+        info = dict(
+          energy=compute_energy(self.state),
+          rmsd=None if self.i_mode else compute_rmsd(self.state, self.target),
+          hydS=hydS,
+          polS=polS,
+          reward=reward,
+        )
+        return self.state["phi_psi"], reward, False, trunc, info
 
 class MetaAmyloidEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
