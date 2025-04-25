@@ -209,10 +209,10 @@ class AmyloidEnv(gym.Env):
         super().__init__()
         self.af2_cif = af2_cif
         self.exp_cif = exp_cif
-        self.max_steps = max_steps
+        self.max_steps = max_steps if max_steps is not None else 120
         self.fixed_dim = fixed_dim
         self.i_mode = inference_mode
-        self.sasa_period = sasa_period
+        self.sasa_period = 1 if sasa_period is None else sasa_period
         self.current_step = 0
 
         # initial & target states
@@ -235,7 +235,7 @@ class AmyloidEnv(gym.Env):
             tgt["phi_psi"] = pad_phi_psi(tgt["phi_psi"], fixed_dim)
             self.target = tgt
 
-        self.action_space = spaces.Box(-5.0, 5.0, (fixed_dim,), np.float32)
+        self.action_space = spaces.Box(-20.0, 20.0, (fixed_dim,), np.float32)
         self.observation_space = spaces.Box(-180.0, 180.0, (fixed_dim,), np.float32)
 
     def reset(self, *, seed=None, options=None):
@@ -276,6 +276,11 @@ class AmyloidEnv(gym.Env):
       writer = PDBIO()
       writer.set_structure(model)
       writer.save(buf)
+
+      xyz_list = []
+      for atom in model.get_atoms():
+          xyz_list.append(atom.get_coord())
+      self.state["coordinates"] = np.asarray(xyz_list, dtype=np.float32)
 
       with tempfile.NamedTemporaryFile("w+", suffix=".pdb") as fh:
           fh.write(buf.getvalue())
