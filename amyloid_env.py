@@ -1,5 +1,5 @@
 # amyloid_env.py  –  Amyloid backbone‑refinement Gym environments
-# Added: real per‑residue SASA via FreeSASA, recomputed every sasa_period steps
+# Added: removal of padding bias, enriched observations with chemical context
 
 import io
 import os
@@ -13,9 +13,9 @@ from gymnasium import spaces
 
 from Bio.PDB import MMCIFParser, PDBParser, PPBuilder, PDBIO
 from Bio.PDB.Polypeptide import is_aa
-from PeptideBuilder import PeptideBuilder, make_structure
+from PeptideBuilder import make_structure
 
-
+# mapping 3-letter → 1-letter
 three_to_one = {
     'ALA': 'A', 'ARG': 'R', 'ASN': 'N', 'ASP': 'D', 'CYS': 'C',
     'GLN': 'Q', 'GLU': 'E', 'GLY': 'G', 'HIS': 'H', 'ILE': 'I',
@@ -36,53 +36,38 @@ def pad_phi_psi(vec, fixed_dim):
 # robust per‑residue SASA extractor (works with all FreeSASA layouts)
 # ─────────────────────────────────────────────────────────────────────────────
 def _sasa_per_residue(structure):
-    """
-    Given a Bio.PDB structure, return a 1D float32 numpy array of
-    total SASA (Å²) for each amino-acid in the chain, in PDB order.
-    """
-    # take only the first chain
     chain = next(structure[0].get_chains())
-
-    # write that chain out to a PDB buffer
     pdb_buf = io.StringIO()
     writer = PDBIO()
     writer.set_structure(chain)
     writer.save(pdb_buf)
 
-    # run freesasa
     with tempfile.NamedTemporaryFile("w+", suffix=".pdb") as fh:
         fh.write(pdb_buf.getvalue())
         fh.flush()
         fs_struct = freesasa.Structure(fh.name)
         res_areas = freesasa.calc(fs_struct).residueAreas()
 
-    # flatten whatever freesasa gives us into a mapping (chain, resSeq)->area.total
     sasa_map = {}
     sample_key = next(iter(res_areas.keys()))
     sample_val = res_areas[sample_key]
 
-    # dict-of-dicts: {'A': {'18': ResidueArea, ...}}
-    if isinstance(sample_val, dict):
+    if isinstance(sample_val, dict):  # dict-of-dicts
         for ch, inner in res_areas.items():
             for seq, area in inner.items():
                 sasa_map[(ch, int(seq))] = float(getattr(area, "total", 0.0))
-
-    # flat "A:18:ARG" → split on “:”
-    elif isinstance(sample_key, str):
+    elif isinstance(sample_key, str):  # "A:18:ARG"
         for key, area in res_areas.items():
             parts = key.split(":")
             if len(parts) == 3:
                 ch, seq, _ = parts
                 sasa_map[(ch, int(seq))] = float(getattr(area, "total", 0.0))
-
-    # ResidueId objects (newer freesasa)
-    else:
+    else:  # ResidueId objects
         for rid, area in res_areas.items():
             ch = getattr(rid, "chain", None) or getattr(rid, "chainLabel")()
             seq = getattr(rid, "number", None) or getattr(rid, "resNumber")()
             sasa_map[(ch, int(seq))] = float(getattr(area, "total", 0.0))
 
-    # now build the vector in the exact residue order Bio.PDB uses
     out = []
     for residue in chain:
         if is_aa(residue):
@@ -91,7 +76,7 @@ def _sasa_per_residue(structure):
     return np.array(out, dtype=np.float32)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# load a single CIF→ features dict (angles, coords, masks, sasa)
+# load a single CIF → features dict (angles, coords, masks, sasa)
 # ─────────────────────────────────────────────────────────────────────────────
 def load_structure(cif_path):
     parser = MMCIFParser(QUIET=True)
@@ -114,7 +99,7 @@ def load_structure(cif_path):
             coords.append(atom.get_coord())
     coords = np.asarray(coords, dtype=np.float32)
 
-    # hydro/polar masks
+    # hydro/polar masks (per residue)
     hyd_set = {"LEU", "ILE", "VAL", "ALA", "MET"}
     pol_set = {"ARG", "LYS", "ASP", "GLU", "GLN", "ASN"}
     hydro_mask = []
@@ -122,8 +107,8 @@ def load_structure(cif_path):
     for residue in chain:
         if is_aa(residue):
             name = residue.get_resname().upper()
-            hydro_mask.append(1 if name in hyd_set else 0)
-            polar_mask.append(1 if name in pol_set else 0)
+            hydro_mask.append(1.0 if name in hyd_set else 0.0)
+            polar_mask.append(1.0 if name in pol_set else 0.0)
     hydro_mask = np.asarray(hydro_mask, dtype=np.float32)
     polar_mask = np.asarray(polar_mask, dtype=np.float32)
 
@@ -140,17 +125,19 @@ def load_structure(cif_path):
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# energy, RMSD, SASA, beta‐fraction & clash terms (all scaled for reward)
+# reward‑term calculations (masking out padding)
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_energy(state):
-    phi = state["phi_psi"]
-    ideal = np.tile([-120.0, 120.0], len(phi)//2).astype(np.float32)
-    return 0.005 * np.sum((phi - ideal)**2)
+    φψ = state["phi_psi"]
+    ideal = np.tile([-120.0, 120.0], len(φψ)//2).astype(np.float32)
+    m = state["mask"]
+    return 0.005 * np.sum(((φψ - ideal)**2) * m)
 
 def compute_rmsd(state, target):
-    a, b = state["phi_psi"], target["phi_psi"]
-    m = min(len(a), len(b))
-    return float(np.sqrt(np.mean((a[:m] - b[:m])**2)))
+    L = state["valid_len"]
+    a = state["phi_psi"][:L]
+    b = target["phi_psi"][:L]
+    return float(np.sqrt(np.mean((a - b)**2)))
 
 def compute_sasa_terms(state):
     s = state["sasa"]
@@ -158,25 +145,27 @@ def compute_sasa_terms(state):
     p = float((s * state["polar_mask"]).sum())
     return h, p
 
-def beta_fraction(phi_psi):
-    phi = phi_psi[0::2]; psi = phi_psi[1::2]
+def beta_fraction(phi_psi, valid_len=None):
+    if valid_len is not None:
+        phi_psi = phi_psi[:valid_len]
+    phi = phi_psi[0::2]
+    psi = phi_psi[1::2]
     return float(((phi >= -150)&(phi <= -90)&(psi >= 90)&(psi <=150)).mean())
 
 def clash_penalty(state, thr=2.0):
     xyz = state["coordinates"]
-    # pairwise distances
     d = np.linalg.norm(xyz[:,None] - xyz[None,:], axis=-1)
     return float(np.clip(thr - d, 0.0, None).sum() * 0.1)
 
-# scaled reward combination
 def reward_func(state, target):
     E = compute_energy(state) / 1000.0
     R = compute_rmsd(state, target) / 10.0
     hS, pS = compute_sasa_terms(state)
     hS /= 200.0; pS /= 200.0
-    βdiff = -abs(beta_fraction(state["phi_psi"]) - beta_fraction(target["phi_psi"]))
+    βs = beta_fraction(state["phi_psi"], state["valid_len"])
+    βt = beta_fraction(target["phi_psi"], state["valid_len"])
+    βdiff = -abs(βs - βt)
     clash = clash_penalty(state)
-
     return (
         -0.40 * E
         -0.30 * R
@@ -187,13 +176,16 @@ def reward_func(state, target):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gym environment
+# apply_action helper
 # ─────────────────────────────────────────────────────────────────────────────
 def apply_action(state, action):
     new = state.copy()
     new["phi_psi"] = pad_phi_psi(state["phi_psi"] + action, len(action))
     return new
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Gym Environment
+# ─────────────────────────────────────────────────────────────────────────────
 class AmyloidEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
 
@@ -215,100 +207,124 @@ class AmyloidEnv(gym.Env):
         self.sasa_period = 1 if sasa_period is None else sasa_period
         self.current_step = 0
 
-        # initial & target states
-        st0 = load_structure(af2_cif)
-        st0["phi_psi"] = pad_phi_psi(st0["phi_psi"], fixed_dim)
+        # ----- initial state -----
+        st0 = load_structure(self.af2_cif)
+        raw_phi = st0["phi_psi"]
+        valid_len = raw_phi.shape[0]
+        st0["valid_len"] = valid_len
+        mask = np.zeros(self.fixed_dim, dtype=np.float32)
+        mask[:valid_len] = 1.0
+        st0["mask"] = mask
+        st0["phi_psi"] = pad_phi_psi(raw_phi, self.fixed_dim)
         self.state = st0
 
+        # ----- target state -----
         parser = MMCIFParser(QUIET=True)
-        structure = parser.get_structure("seq", af2_cif)
+        structure = parser.get_structure("seq", self.af2_cif)
         chain = next(structure[0].get_chains())
         self.sequence = ''.join(
-          three_to_one.get(res.get_resname(), 'A')
-          for res in chain if is_aa(res)
+            three_to_one.get(res.get_resname(), 'A')
+            for res in chain if is_aa(res)
         )
-
-        if inference_mode or exp_cif is None:
-            self.target = st0.copy()
+        if self.i_mode or self.exp_cif is None:
+            tgt = st0.copy()
         else:
-            tgt = load_structure(exp_cif)
-            tgt["phi_psi"] = pad_phi_psi(tgt["phi_psi"], fixed_dim)
-            self.target = tgt
+            tgt0 = load_structure(self.exp_cif)
+            raw_phi_t = tgt0["phi_psi"]
+            tgt0["valid_len"] = raw_phi_t.shape[0]
+            mask_t = np.zeros(self.fixed_dim, dtype=np.float32)
+            mask_t[:tgt0["valid_len"]] = 1.0
+            tgt0["mask"] = mask_t
+            tgt0["phi_psi"] = pad_phi_psi(raw_phi_t, self.fixed_dim)
+            tgt = tgt0
+        self.target = tgt
 
-        self.action_space = spaces.Box(-20.0, 20.0, (fixed_dim,), np.float32)
-        self.observation_space = spaces.Box(-180.0, 180.0, (fixed_dim,), np.float32)
+        # action space
+        self.action_space = spaces.Box(-20.0, 20.0, (self.fixed_dim,), np.float32)
+
+        # observation space: [φψ_norm | hydro_mask_pad | polar_mask_pad]
+        low = np.concatenate([
+            np.full(self.fixed_dim, -1.0, dtype=np.float32),
+            np.zeros(self.fixed_dim, dtype=np.float32)
+        ])
+        high = np.concatenate([
+            np.ones(self.fixed_dim, dtype=np.float32),
+            np.ones(self.fixed_dim, dtype=np.float32)
+        ])
+        self.observation_space = spaces.Box(low, high, dtype=np.float32)
+
+    def _build_obs(self):
+        φψ_norm = self.state["phi_psi"] / 180.0
+        orig_hm = self.state["hydro_mask"]
+        orig_pm = self.state["polar_mask"]
+        pad_res = self.fixed_dim // 2
+
+        # safely truncate or pad
+        hm = np.zeros(pad_res, dtype=np.float32)
+        pm = np.zeros(pad_res, dtype=np.float32)
+
+        # only copy up to pad_res entries
+        end_h = min(orig_hm.shape[0], pad_res)
+        hm[:end_h] = orig_hm[:end_h]
+
+        end_p = min(orig_pm.shape[0], pad_res)
+        pm[:end_p] = orig_pm[:end_p]
+
+        return np.concatenate([φψ_norm, hm, pm], axis=0)
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self.current_step = 0
         st = load_structure(self.af2_cif)
-        st["phi_psi"] = pad_phi_psi(st["phi_psi"], self.fixed_dim)
+        raw_phi = st["phi_psi"]
+        valid_len = raw_phi.shape[0]
+        st["valid_len"] = valid_len
+        mask = np.zeros(self.fixed_dim, dtype=np.float32)
+        mask[:valid_len] = 1.0
+        st["mask"] = mask
+        st["phi_psi"] = pad_phi_psi(raw_phi, self.fixed_dim)
         self.state = st
-        return self.state["phi_psi"], {}
+        obs = self._build_obs()
+        return obs, {}
 
     def _maybe_recompute_sasa(self):
-      if not self.sasa_period or (self.current_step % self.sasa_period != 0):
-          return
-
-      phi_psi_vec = self.state["phi_psi"]
-      max_pairs = len(phi_psi_vec) // 2
-      N = min(len(self.sequence), max_pairs)
-      if N == 0:
-          return
-
-      seq = self.sequence[:N]  # true one-letter sequence
-      flat = phi_psi_vec[:2 * N]
-      phi_list = np.radians(flat[0::2])                     # length N
-      psi_actual = np.radians(flat[1::2])                   # length N
-      psi_im1 = [np.radians(120.0)] + psi_actual[:-1].tolist()  # also length N
-
-      if len(phi_list) != len(psi_im1) or len(seq) != len(phi_list):
-          if self.current_step == 1:
-              print(f"[SASA] Skipping: φ={len(phi_list)} ψ_im1={len(psi_im1)} seq={len(seq)}")
-          return
-
-      model = make_structure(seq, phi=phi_list, psi_im1=psi_im1)
-      if model is None:
-          print("[SASA] make_structure() returned None; skipping")
-          return
-
-      buf = io.StringIO()
-      writer = PDBIO()
-      writer.set_structure(model)
-      writer.save(buf)
-
-      xyz_list = []
-      for atom in model.get_atoms():
-          xyz_list.append(atom.get_coord())
-      self.state["coordinates"] = np.asarray(xyz_list, dtype=np.float32)
-
-      with tempfile.NamedTemporaryFile("w+", suffix=".pdb") as fh:
-          fh.write(buf.getvalue())
-          fh.flush()
-          struct_tmp = PDBParser(QUIET=True).get_structure("tmp", fh.name)
-          sasa_vec = _sasa_per_residue(struct_tmp)
-
-      self.state["sasa"] = sasa_vec
-
-      # rebuild hydrophobic/polar masks based on sequence
-      hyd_set = {"L", "I", "V", "A", "M"}
-      pol_set = {"R", "K", "D", "E", "Q", "N"}
-      self.state["hydro_mask"] = np.array([1 if aa in hyd_set else 0 for aa in seq], dtype=np.float32)
-      self.state["polar_mask"] = np.array([1 if aa in pol_set else 0 for aa in seq], dtype=np.float32)
-
-
-
+        if not self.sasa_period or (self.current_step % self.sasa_period != 0):
+            return
+        phi_psi_vec = self.state["phi_psi"]
+        max_pairs = len(phi_psi_vec) // 2
+        N = min(len(self.sequence), max_pairs)
+        if N == 0:
+            return
+        seq = self.sequence[:N]
+        flat = phi_psi_vec[:2 * N]
+        phi_list = np.radians(flat[0::2])
+        psi_actual = np.radians(flat[1::2])
+        psi_im1 = [np.radians(120.0)] + psi_actual[:-1].tolist()
+        model = make_structure(seq, phi=phi_list, psi_im1=psi_im1)
+        if model is None:
+            return
+        buf = io.StringIO()
+        writer = PDBIO()
+        writer.set_structure(model)
+        writer.save(buf)
+        xyz_list = [atom.get_coord() for atom in model.get_atoms()]
+        self.state["coordinates"] = np.asarray(xyz_list, dtype=np.float32)
+        with tempfile.NamedTemporaryFile("w+", suffix=".pdb") as fh:
+            fh.write(buf.getvalue())
+            fh.flush()
+            struct_tmp = PDBParser(QUIET=True).get_structure("tmp", fh.name)
+            sasa_vec = _sasa_per_residue(struct_tmp)
+        self.state["sasa"] = sasa_vec
+        hyd_set = {"L", "I", "V", "A", "M"}
+        pol_set = {"R", "K", "D", "E", "Q", "N"}
+        self.state["hydro_mask"] = np.array([1.0 if aa in hyd_set else 0.0 for aa in seq], dtype=np.float32)
+        self.state["polar_mask"] = np.array([1.0 if aa in pol_set else 0.0 for aa in seq], dtype=np.float32)
 
     def step(self, action):
         self.current_step += 1
         self.state = apply_action(self.state, action)
         self._maybe_recompute_sasa()
-
-        if self.i_mode:
-            rew = 0.0
-        else:
-            rew = reward_func(self.state, self.target)
-
+        rew = 0.0 if self.i_mode else reward_func(self.state, self.target)
         hS, pS = compute_sasa_terms(self.state)
         info = {
             "step": self.current_step,
@@ -318,10 +334,9 @@ class AmyloidEnv(gym.Env):
             "polS": pS,
             "reward": rew,
         }
-
         done = False
         trunc = (self.current_step >= self.max_steps)
-        obs = self.state["phi_psi"]
+        obs = self._build_obs()
         return obs, rew, done, trunc, info
 
     def render(self, mode="human"):
@@ -338,8 +353,6 @@ class MetaAmyloidEnv(gym.Env):
         self.pairs = pairs
         self.kw = kwargs
         self.current_env = None
-
-        # infer spaces from one instance
         env0 = AmyloidEnv(*pairs[0], **kwargs)
         self.observation_space = env0.observation_space
         self.action_space = env0.action_space
