@@ -4,7 +4,7 @@ import numpy as np
 from stable_baselines3 import PPO
 
 # Import the environment and helper functions from amyloid_env.py
-from amyloid_env import AmyloidEnv, load_structure, pad_phi_psi
+from amyloid_env_v0 import AmyloidEnv, load_structure, pad_phi_psi
 
 # Import your rebuild module (ensure this module is implemented)
 from rebuild_structure import rebuild_structure_from_angles

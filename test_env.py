@@ -1,9 +1,9 @@
 import os
-from amyloid_env import AmyloidEnv, load_structure  # assuming your code is in amyloid_env.py
+from amyloid_env_v0 import AmyloidEnv, load_structure  # assuming your code is in amyloid_env.py
 import numpy as np
 
 def test_environment(sample_dir="data"):
-    from amyloid_env import get_all_samples
+    from amyloid_env_v0 import get_all_samples
     pairs = get_all_samples(sample_dir)
     assert len(pairs) > 0, "No CIF sample pairs found."
 
