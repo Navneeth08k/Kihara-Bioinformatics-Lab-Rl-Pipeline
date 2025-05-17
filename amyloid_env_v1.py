@@ -422,6 +422,22 @@ class AmyloidEnv(gym.Env):
         psi  = np.radians(phi_psi_vec[1:2*N:2])
 
         mono = build_full_chain(seq, phi, psi)
+        mono_sasa = _sasa_per_residue(mono)              # (N,)
+        tri_sasa  = _sasa_per_residue(assemble_models(copies))
+
+        # interface burial per residue
+        buried_per_res = mono_sasa - tri_sasa
+
+        # split into hydrophobic vs polar
+        hyd_buried = float((buried_per_res * self.state["hydro_mask"][:len(buried_per_res)]).sum())
+        pol_buried = float((buried_per_res * self.state["polar_mask"][:len(buried_per_res)]).sum())
+
+        self.state.update({
+            "hyd_buried": hyd_buried,
+            "pol_buried": pol_buried,
+            "total_buried": float(buried_per_res.sum()),
+            # keep clash/R_rmsd you already cache
+        })
         copies = replicate_chain(mono, n_copy=3)
         self.state["copies"] = copies                       # cache for clash
         self.state["buried"] = buried_interface_sasa(copies)
@@ -454,7 +470,8 @@ class AmyloidEnv(gym.Env):
 
 
         # 3) Compute raw terms
-        E    = compute_energy(self.state)                          # raw, unscaled
+        E    = compute_energy(self.state)  # raw, unscaled  
+        E_scaled = E / 1000                      
         R    = compute_rmsd(self.state, self.target)               # raw, unscaled
         hS, pS = compute_sasa_terms(self.state)
         delta_h = self.prev_hS - hS
@@ -465,18 +482,21 @@ class AmyloidEnv(gym.Env):
         clash = self.state["clash_ic"]     # replaces clash_penalty(self.state)
 
 
-        Δburied = self.state["buried"] - self.prev_buried
-        self.prev_buried = self.state["buried"]
+        Δhyd = self.state["hyd_buried"] - self.prev_hyd
+        Δpol = self.prev_pol - self.state["pol_buried"]   # want pol_buried to go *down*
+        self.prev_hyd, self.prev_pol = self.state["hyd_buried"], self.state["pol_buried"]
 
-        if self.global_step < 10_000:           # warm-up
-            rew = 2.0 * max(Δburied, 0.0)
+        if self.global_step < 10_000:          # warm-up: interface shaping only
+            rew =  0.02 * max(Δhyd, 0) + 0.01 * max(Δpol, 0)   # Å² → ~ 0-2 range
         else:
-            rew = (
-                -0.05 * compute_energy(self.state) / 1000.0
-                -0.10 * self.state["R_rmsd"] / 2.0
-                +2.0  * max(Δburied, 0.0)
-                -0.01 * self.state["clash_ic"]
+            rew  = (
+                -0.05 * E_scaled                       # as before
+                -0.05 * self.state["R_rmsd"] / 2       # half weight
+                + 0.02 * max(Δhyd, 0)
+                + 0.01 * max(Δpol, 0)
+                - 0.005 * self.state["clash_ic"]
             )
+
 
 
         # 5) Update previous SASA for next delta
