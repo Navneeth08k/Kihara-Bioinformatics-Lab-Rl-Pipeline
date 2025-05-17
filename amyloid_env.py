@@ -154,25 +154,37 @@ def beta_fraction(phi_psi, valid_len=None):
 
 def clash_penalty(state, thr=2.0):
     xyz = state["coordinates"]
-    d = np.linalg.norm(xyz[:,None] - xyz[None,:], axis=-1)
-    return float(np.clip(thr - d, 0.0, None).sum() * 0.1)
+    d = np.linalg.norm(xyz[:, None] - xyz[None, :], axis=-1)
 
-def reward_func(state, target):
+    # consider only the *largest* overlap per atom and cap it
+    per_atom = np.clip(thr - d, 0.0, 0.5).max(axis=1)   # ← CHANGE
+    return float(per_atom.sum())                        # ← CHANGE
+
+
+def reward_func(state, target, delta_hS, delta_pS):
     E = compute_energy(state) / 1000.0
     R = compute_rmsd(state, target) / 10.0
-    hS, pS = compute_sasa_terms(state)
-    hS /= 200.0; pS /= 200.0
+    # delta‐SASA shaping
+    Δh = delta_hS   # positive when hydrophobic burial increases
+    Δp = delta_pS   # positive when polar exposure increases
     βs = beta_fraction(state["phi_psi"], state["valid_len"])
     βt = beta_fraction(target["phi_psi"], state["valid_len"])
     βdiff = -abs(βs - βt)
     clash = clash_penalty(state)
+    
+
+    # curriculum
+    if self.global_step < 50_000:
+        return 1.0 * Δh + 0.5 * Δp
+
+    # full reward
     return (
-        -0.40 * E
-        -0.30 * R
-        -0.15 * hS
-        +0.10 * pS
+        -0.10 * E
+        -0.05 * R
+        +1.0 * Δh
+        +0.5 * Δp
         +0.10 * βdiff
-        -0.05 * clash
+        -0.01 * clash
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -206,6 +218,7 @@ class AmyloidEnv(gym.Env):
         self.i_mode = inference_mode
         self.sasa_period = 1 if sasa_period is None else sasa_period
         self.current_step = 0
+        self.global_step = 0
 
         # ----- initial state -----
         st0 = load_structure(self.af2_cif)
@@ -217,6 +230,10 @@ class AmyloidEnv(gym.Env):
         st0["mask"] = mask
         st0["phi_psi"] = pad_phi_psi(raw_phi, self.fixed_dim)
         self.state = st0
+        # initialize previous SASA for delta‐SASA shaping
+        h0, p0 = compute_sasa_terms(self.state)
+        self.prev_hS, self.prev_pS = h0, p0
+
 
         # ----- target state -----
         parser = MMCIFParser(QUIET=True)
@@ -284,6 +301,9 @@ class AmyloidEnv(gym.Env):
         st["mask"] = mask
         st["phi_psi"] = pad_phi_psi(raw_phi, self.fixed_dim)
         self.state = st
+        # reset previous SASA
+        h0, p0 = compute_sasa_terms(self.state)
+        self.prev_hS, self.prev_pS = h0, p0
         obs = self._build_obs()
         return obs, {}
 
@@ -321,23 +341,75 @@ class AmyloidEnv(gym.Env):
         self.state["polar_mask"] = np.array([1.0 if aa in pol_set else 0.0 for aa in seq], dtype=np.float32)
 
     def step(self, action):
+        """
+        Apply an action (delta φ/ψ), rebuild SASA/clash as needed, and return
+        (obs, reward, done, trunc, info) with a two‐stage curriculum:
+         - First 20k steps: maximize ΔhydS & ΔpolS only
+         - Thereafter: full reward with lighter penalties & supercharged SASA
+        """
+        # 1) Increment global and episode steps
+        self.global_step  += 1
         self.current_step += 1
+
+        # 2) Apply the action and rebuild backbone / SASA
         self.state = apply_action(self.state, action)
         self._maybe_recompute_sasa()
-        rew = 0.0 if self.i_mode else reward_func(self.state, self.target)
+
+        # 3) Compute raw terms
+        E    = compute_energy(self.state)                          # raw, unscaled
+        R    = compute_rmsd(self.state, self.target)               # raw, unscaled
         hS, pS = compute_sasa_terms(self.state)
+        delta_h = self.prev_hS - hS
+        delta_p = pS - self.prev_pS
+        beta_s = beta_fraction(self.state["phi_psi"], self.state["valid_len"])
+        beta_t = beta_fraction(self.target["phi_psi"], self.state["valid_len"])
+        beta_diff = -abs(beta_s - beta_t)
+        clash = clash_penalty(self.state)
+
+        # 4) Compute reward with curriculum
+        if self.global_step < 20_000:
+            # Stage 1: pure SASA shaping
+            rew = 0.50 * delta_h + 0.20 * delta_p
+        else:
+            # Stage 2: full reward
+            rew = (
+                -0.10 * (E / 1000.0)      # energy /1000
+                -0.05 * (R / 10.0)        # RMSD /10
+                + 0.50 * delta_h          # supercharged hydrophobic burial
+                + 0.20 * delta_p          # supercharged polar exposure
+                + 0.10 * beta_diff        # beta‐sheet matching
+                - 0.01 * clash            # capped clash penalty
+            )
+
+        # 5) Update previous SASA for next delta
+        self.prev_hS, self.prev_pS = hS, pS
+
+        # 6) Build info dict for TensorBoard
         info = {
-            "step": self.current_step,
-            "energy": compute_energy(self.state),
-            "rmsd": None if self.i_mode else compute_rmsd(self.state, self.target),
-            "hydS": hS,
-            "polS": pS,
-            "reward": rew,
+            "step":    self.current_step,
+            "global_step": self.global_step,
+            "energy":  E,
+            "rmsd":    None if self.i_mode else R,
+            "hydS":    hS,
+            "polS":    pS,
+            "ΔhydS":   delta_h,
+            "ΔpolS":   delta_p,
+            "beta":    beta_diff,
+            "clash":   clash,
+            "reward":  rew,
         }
-        done = False
+
+        # 7) Check truncation
+        done  = False
         trunc = (self.current_step >= self.max_steps)
+
+        # 8) Build next observation
         obs = self._build_obs()
+
         return obs, rew, done, trunc, info
+
+    
+
 
     def render(self, mode="human"):
         print(f"[{self.current_step:02d}] E={compute_energy(self.state):.1f} "
