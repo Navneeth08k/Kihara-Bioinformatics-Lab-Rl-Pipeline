@@ -2,6 +2,7 @@
 #strictly the backbone, we are rebuilding the whole protein as this gives us a more full picture
 #of how all these metrics impact rmsd etc... The thinking is that this will give a stronger
 #signal for learning.
+
 import io
 import os
 import random
@@ -44,44 +45,50 @@ def pad_phi_psi(vec, fixed_dim):
 # robust per‑residue SASA extractor (works with all FreeSASA layouts)
 # ─────────────────────────────────────────────────────────────────────────────
 def _sasa_per_residue(structure):
-    chain = next(structure[0].get_chains())
+    """
+    Compute per‐residue SASA for **one chain** (the first chain), 
+    but *in the context* of all its neighbors (if any).
+    """
+    # 1) Identify the chain we care about
+    model  = structure[0]                  # first Model of the Structure
+    chain0 = next(model.get_chains())     # grab chain A
+    
+    # 2) Write *entire* model (all chains) to PDB for FreeSASA
     pdb_buf = io.StringIO()
-    writer = PDBIO()
-    writer.set_structure(chain)
+    writer  = PDBIO()
+    writer.set_structure(model)           # ← note: model, not chain0
     writer.save(pdb_buf)
-
+    
+    # 3) Run FreeSASA on that PDB
     with tempfile.NamedTemporaryFile("w+", suffix=".pdb") as fh:
         fh.write(pdb_buf.getvalue())
         fh.flush()
         fs_struct = freesasa.Structure(fh.name)
         res_areas = freesasa.calc(fs_struct).residueAreas()
-
+    
+    # 4) Build a mapping (chainID, resSeq) → area.total
     sasa_map = {}
-    sample_key = next(iter(res_areas.keys()))
-    sample_val = res_areas[sample_key]
-
-    if isinstance(sample_val, dict):  # dict-of-dicts
+    sample_key, sample_val = next(iter(res_areas.items()))
+    if isinstance(sample_val, dict):
         for ch, inner in res_areas.items():
             for seq, area in inner.items():
-                sasa_map[(ch, int(seq))] = float(getattr(area, "total", 0.0))
-    elif isinstance(sample_key, str):  # "A:18:ARG"
+                sasa_map[(ch, int(seq))] = float(area.total)
+    else:
         for key, area in res_areas.items():
+            # "A:18:ARG" or similar
             parts = key.split(":")
             if len(parts) == 3:
                 ch, seq, _ = parts
-                sasa_map[(ch, int(seq))] = float(getattr(area, "total", 0.0))
-    else:  # ResidueId objects
-        for rid, area in res_areas.items():
-            ch = getattr(rid, "chain", None) or getattr(rid, "chainLabel")()
-            seq = getattr(rid, "number", None) or getattr(rid, "resNumber")()
-            sasa_map[(ch, int(seq))] = float(getattr(area, "total", 0.0))
-
+                sasa_map[(ch, int(seq))] = float(area.total)
+    
+    # 5) Extract per‐residue SASA *for that first chain* in order
     out = []
-    for residue in chain:
+    for residue in chain0:
         if is_aa(residue):
-            key = (chain.id, residue.id[1])
+            key = (chain0.id, residue.id[1])
             out.append(sasa_map.get(key, 0.0))
     return np.array(out, dtype=np.float32)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # load a single CIF → features dict (angles, coords, masks, sasa)
@@ -348,6 +355,8 @@ class AmyloidEnv(gym.Env):
 
         # now we have exp_trimer and sequence – safe to build trimer once
         self._rebuild_trimer()
+        self.prev_hyd = self.state["hyd_buried"]
+        self.prev_pol = self.state["pol_buried"]
         self.prev_buried = self.state["buried"]
 
         # action space
@@ -402,6 +411,8 @@ class AmyloidEnv(gym.Env):
         st["phi_psi"] = pad_phi_psi(raw_phi, self.fixed_dim)
         self.state = st
         self._rebuild_trimer()
+        self.prev_hyd = self.state["hyd_buried"]
+        self.prev_pol = self.state["pol_buried"]
         self.prev_buried = self.state["buried"]
 
         # reset previous SASA
@@ -422,8 +433,12 @@ class AmyloidEnv(gym.Env):
         psi  = np.radians(phi_psi_vec[1:2*N:2])
 
         mono = build_full_chain(seq, phi, psi)
+        copies = replicate_chain(mono, n_copy=3)
         mono_sasa = _sasa_per_residue(mono)              # (N,)
         tri_sasa  = _sasa_per_residue(assemble_models(copies))
+
+        # ⬇︎ keep monomer SASA current so compute_sasa_terms is meaningful
+        self.state["sasa"] = mono_sasa               #  ← add this line
 
         # interface burial per residue
         buried_per_res = mono_sasa - tri_sasa
@@ -438,7 +453,7 @@ class AmyloidEnv(gym.Env):
             "total_buried": float(buried_per_res.sum()),
             # keep clash/R_rmsd you already cache
         })
-        copies = replicate_chain(mono, n_copy=3)
+        
         self.state["copies"] = copies                       # cache for clash
         self.state["buried"] = buried_interface_sasa(copies)
 
@@ -504,17 +519,17 @@ class AmyloidEnv(gym.Env):
 
         # 6) Build info dict for TensorBoard
         info = {
-            "step":    self.current_step,
-            "global_step": self.global_step,
-            "energy":  E,
-            "rmsd":    None if self.i_mode else R,
-            "hydS":    hS,
-            "polS":    pS,
-            "ΔhydS":   delta_h,
-            "ΔpolS":   delta_p,
-            "beta":    beta_diff,
-            "clash":   clash,
-            "reward":  rew,
+            "step":          self.current_step,
+            "global_step":   self.global_step,
+            "energy":        E,
+            "rmsd":          None if self.i_mode else R,
+            "hyd_buried":    self.state["hyd_buried"],
+            "pol_buried":    self.state["pol_buried"],
+            "total_buried":  self.state["total_buried"],
+            "Δhyd":          Δhyd,
+            "Δpol":          Δpol,
+            "clash":         clash,
+            "reward":        rew,
         }
 
         # 7) Check truncation

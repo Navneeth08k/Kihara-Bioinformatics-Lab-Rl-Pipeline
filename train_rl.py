@@ -54,12 +54,18 @@ def make_env(pair, fixed_dim, sasa_period=5):
 
 # ---------- TensorBoard callback --------------------------------------
 class MetricTBCallback(BaseCallback):
-    """Log custom metrics placed in env info dict."""
+    """Log custom metrics placed in env-info dict."""
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
         if not infos:
             return True
-        keys = ["energy", "rmsd", "hydS", "polS", "clash", "ΔhydS", "ΔpolS", "reward"]
+        # metrics that the env now returns in info{}
+        keys = [
+            "energy", "rmsd",
+            "hyd_buried", "pol_buried", "total_buried",
+            "Δhyd", "Δpol",
+            "clash", "reward",
+        ]
         acc = {k: [] for k in keys}
         for info in infos:
             for k in keys:
