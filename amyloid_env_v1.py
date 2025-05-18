@@ -51,6 +51,10 @@ def _sasa_per_residue(structure):
     """
     # 1) Identify the chain we care about
     model  = structure[0]                  # first Model of the Structure
+    # ── PDBIO only supports single‐char chain IDs ──
+    for i, chain in enumerate(model.get_chains()):
+        # map to 'A','B','C',… wrapping around if needed
+        chain.id = chr(ord('A') + (i % 26))
     chain0 = next(model.get_chains())     # grab chain A
     
     # 2) Write *entire* model (all chains) to PDB for FreeSASA
@@ -60,7 +64,7 @@ def _sasa_per_residue(structure):
     writer.save(pdb_buf)
     
     # 3) Run FreeSASA on that PDB
-    with tempfile.NamedTemporaryFile("w+", suffix=".pdb") as fh:
+    with tempfile.NamedTemporaryFile("w", suffix=".pdb") as fh:
         fh.write(pdb_buf.getvalue())
         fh.flush()
         fs_struct = freesasa.Structure(fh.name)
@@ -98,7 +102,7 @@ def load_structure(cif_path):
     structure = parser.get_structure("prot", cif_path)
     chain = next(structure[0].get_chains())
 
-    # φ/ψ + residue indices
+    # φ/ψ  residue indices
     phi_psi = []
     res_ids = []
     for pp in PPBuilder().build_peptides(chain):
@@ -183,7 +187,7 @@ def clash_penalty(state, thr=2.0):
 # ─────────────────────────────────────────────────────────────────────────────
 def apply_action(state, action):
     new = state.copy()
-    new["phi_psi"] = pad_phi_psi(state["phi_psi"] + action, len(action))
+    new["phi_psi"] = pad_phi_psi(state["phi_psi"]  + action, len(action))
     return new
 
 
@@ -191,7 +195,7 @@ def apply_action(state, action):
 FIBRIL_LATTICE = np.array([4.9, 0.0, 0.0])   # Å  ← replace with your true lattice
 
 def build_full_chain(seq, phi, psi):
-    """Backbone+side-chains with PeptideBuilder."""
+    """Backboneside-chains with PeptideBuilder."""
     model = make_structure(seq, phi=phi, psi_im1=[np.radians(120)] + psi[:-1].tolist())
     if model is None:
         raise ValueError("PeptideBuilder failed.")
@@ -223,7 +227,7 @@ def assemble_models(models):
         # m is a Structure; grab its first (and only) chain
         orig_chain = next(m.get_chains())
         # give it a new chain ID (A, B, C...)
-        new_chain = Chain(chr(ord("A") + idx))
+        new_chain = Chain(chr(ord("A")  + idx))
         # deep‐copy residues into the new chain
         for residue in orig_chain:
             new_chain.add(residue.copy())
@@ -294,6 +298,7 @@ class AmyloidEnv(gym.Env):
         fixed_dim=128,
         inference_mode=False,
         sasa_period=5,
+        
     ):
         super().__init__()
         self.af2_cif = af2_cif
@@ -314,6 +319,9 @@ class AmyloidEnv(gym.Env):
         mask[:valid_len] = 1.0
         st0["mask"] = mask
         st0["phi_psi"] = pad_phi_psi(raw_phi, self.fixed_dim)
+        st0["hydro_mask"]= pad_phi_psi(st0["hydro_mask"], self.fixed_dim)
+        st0["polar_mask"]= pad_phi_psi(st0["polar_mask"], self.fixed_dim)
+        st0["sasa"] = pad_phi_psi(st0["sasa"], self.fixed_dim)
         
         self.state = st0  
         # initialize previous SASA for delta‐SASA shaping
@@ -361,8 +369,9 @@ class AmyloidEnv(gym.Env):
 
         # action space
         self.action_space = spaces.Box(-20.0, 20.0, (self.fixed_dim,), np.float32)
+        self.render_mode = None
 
-        core_len = 2 * self.fixed_dim          # φ/ψ + hydro_mask
+        core_len = 2 * self.fixed_dim          # φ/ψ  hydro_mask
         low_core = np.concatenate([
             np.full(self.fixed_dim, -1.0, dtype=np.float32),   # φ/ψ_norm
             np.zeros(self.fixed_dim, dtype=np.float32),        # hydro_mask
@@ -376,6 +385,7 @@ class AmyloidEnv(gym.Env):
         high = np.concatenate([high_core, np.array([1.0, 1.0])])
 
         self.observation_space = spaces.Box(low, high, dtype=np.float32)
+        
 
 
 
@@ -410,6 +420,10 @@ class AmyloidEnv(gym.Env):
         st["mask"] = mask
         st["phi_psi"] = pad_phi_psi(raw_phi, self.fixed_dim)
         self.state = st
+        # pad the newly loaded masks & sasa so they match fixed_dim
+        self.state["hydro_mask"] = pad_phi_psi(self.state["hydro_mask"], self.fixed_dim)
+        self.state["polar_mask"] = pad_phi_psi(self.state["polar_mask"], self.fixed_dim)
+        self.state["sasa"]       = pad_phi_psi(self.state["sasa"],       self.fixed_dim)
         self._rebuild_trimer()
         self.prev_hyd = self.state["hyd_buried"]
         self.prev_pol = self.state["pol_buried"]
@@ -423,6 +437,7 @@ class AmyloidEnv(gym.Env):
 
     def _rebuild_trimer(self):
         """Rebuild full-atom monomer → replicate → cache SASA, RMSD, clash."""
+        
         phi_psi_vec = self.state["phi_psi"]
         max_pairs   = len(phi_psi_vec) // 2
         N           = min(len(self.sequence), max_pairs)
@@ -438,7 +453,8 @@ class AmyloidEnv(gym.Env):
         tri_sasa  = _sasa_per_residue(assemble_models(copies))
 
         # ⬇︎ keep monomer SASA current so compute_sasa_terms is meaningful
-        self.state["sasa"] = mono_sasa               #  ← add this line
+        # pad the updated monomer SASA to fixed_dim so compute_sasa_terms works
+        self.state["sasa"] = pad_phi_psi(mono_sasa, self.fixed_dim)
 
         # interface burial per residue
         buried_per_res = mono_sasa - tri_sasa
@@ -504,13 +520,15 @@ class AmyloidEnv(gym.Env):
         if self.global_step < 10_000:          # warm-up: interface shaping only
             rew =  0.02 * max(Δhyd, 0) + 0.01 * max(Δpol, 0)   # Å² → ~ 0-2 range
         else:
-            rew  = (
-                -0.05 * E_scaled                       # as before
-                -0.05 * self.state["R_rmsd"] / 2       # half weight
-                + 0.02 * max(Δhyd, 0)
-                + 0.01 * max(Δpol, 0)
-                - 0.005 * self.state["clash_ic"]
+            # every step, full reward with stronger shaping
+            rew = (
+                +0.10 * max(Δhyd, 0)
+                +0.05 * max(Δpol, 0)
+                -0.03 * E_scaled
+                -0.03 * (self.state["R_rmsd"] / 2)
+                -0.005 * self.state["clash_ic"]
             )
+
 
 
 
@@ -561,6 +579,8 @@ class MetaAmyloidEnv(gym.Env):
         env0 = AmyloidEnv(*pairs[0], **kwargs)
         self.observation_space = env0.observation_space
         self.action_space = env0.action_space
+        self.render_mode = None
+
 
     def reset(self, **kwargs):
         af2, exp = random.choice(self.pairs)
