@@ -23,6 +23,10 @@ from PeptideBuilder import make_structure
 
 from Bio.PDB.Superimposer import Superimposer         # new
 from scipy.spatial.distance import cdist              # new
+from Bio.PDB.NeighborSearch import NeighborSearch
+from Bio.PDB.DSSP import dssp_dict_from_pdb_file
+# or simple χ1/χ2 dihedral check; reward: -0.01 * n_outliers
+from Bio.PDB.vectors import calc_dihedral # <-- NEW
 
 # mapping 3-letter → 1-letter
 three_to_one = {
@@ -93,6 +97,20 @@ def _sasa_per_residue(structure):
             out.append(sasa_map.get(key, 0.0))
     return np.array(out, dtype=np.float32)
 
+def strand_register_offset(pred_chain, exp_chain, axis=0):
+    pred_z = np.array([a.get_coord()[axis] for a in pred_chain.get_atoms()
+                       if a.get_name() == "CA"])
+    exp_z  = np.array([a.get_coord()[axis] for a in exp_chain.get_atoms()
+                       if a.get_name() == "CA"])
+    n = min(len(pred_z), len(exp_z))
+    off = np.round(np.mean(pred_z[:n] - exp_z[:n]) / 3.4)   # ~3.4 Å per residue
+    return abs(off)
+
+def broken_hbonds(struct):
+    atoms = [a for a in struct.get_atoms() if a.element in ("O","N")]
+    ns = NeighborSearch(atoms)
+    broken = sum(1 for a in atoms if len(ns.search(a.get_coord(), 2.7)) == 1) # only itself
+    return broken
 
 # ─────────────────────────────────────────────────────────────────────────────
 # load a single CIF → features dict (angles, coords, masks, sasa)
@@ -212,6 +230,25 @@ def replicate_chain(chain_struct, n_copy=3):
             atom.set_coord(atom.get_coord() + i * FIBRIL_LATTICE)
         copies.append(copy)
     return copies
+
+def rotamer_outliers(struct):
+    """χ1 only, Dunbrack thresholds ~±60°.  Returns integer count."""
+    out = 0
+    for residue in struct[0].get_residues():
+        if not is_aa(residue):
+            continue
+        # need four atoms for χ1: N-CA-CB-CG (& analogues)
+        try:
+            n, ca, cb, cg = (residue[a] for a in ("N", "CA", "CB", "CG"))
+        except KeyError:
+            continue
+        v1, v2, v3 = (ca.get_vector()-n.get_vector(),
+                      cb.get_vector()-ca.get_vector(),
+                      cg.get_vector()-cb.get_vector())
+        angle = calc_dihedral(v1, v2, v3) * 180/np.pi
+        if np.abs(angle) > 120:   # outside trans / gauche± windows
+            out += 1
+    return out
 
 def assemble_models(models):
     """
@@ -477,6 +514,19 @@ class AmyloidEnv(gym.Env):
             self.state["R_rmsd"] = trimer_rmsd(copies, self.exp_trimer)
         else:
             self.state["R_rmsd"] = 0.0
+        
+        # -------- NEW quality terms ----------------------------------------
+        if self.exp_trimer:
+            exp_chain  = next(self.exp_trimer.get_chains())
+            pred_chain = next(copies[0].get_chains())            # first replica
+            self.state["reg_off"]  = strand_register_offset(pred_chain, exp_chain)
+        else:
+            self.state["reg_off"]  = 0.0
+
+        self.state["hb_err"]   = broken_hbonds(copies[0])        # monomer quality
+        self.state["rot_out"]  = rotamer_outliers(copies[0])
+        # -------------------------------------------------------------------
+
 
         self.state["clash_ic"] = inter_chain_clash(copies)
 
@@ -515,19 +565,28 @@ class AmyloidEnv(gym.Env):
 
         Δhyd = self.state["hyd_buried"] - self.prev_hyd
         Δpol = self.prev_pol - self.state["pol_buried"]   # want pol_buried to go *down*
+
+        # NEW: pull cached values
+        reg = self.state["reg_off"]
+        hb  = self.state["hb_err"]
+        rot = self.state["rot_out"]
+
         self.prev_hyd, self.prev_pol = self.state["hyd_buried"], self.state["pol_buried"]
 
-        if self.global_step < 10_000:          # warm-up: interface shaping only
-            rew =  0.02 * max(Δhyd, 0) + 0.01 * max(Δpol, 0)   # Å² → ~ 0-2 range
+        if self.global_step < 10_000:          # warm-up
+            rew = 0.02*max(Δhyd,0) + 0.01*max(Δpol,0)
         else:
-            # every step, full reward with stronger shaping
             rew = (
                 +0.10 * max(Δhyd, 0)
                 +0.05 * max(Δpol, 0)
                 -0.03 * E_scaled
                 -0.03 * (self.state["R_rmsd"] / 2)
-                -0.005 * self.state["clash_ic"]
+                -0.02 * reg
+                -0.01 * hb
+                -0.01 * rot
+                -0.005* self.state["clash_ic"]
             )
+
 
 
 
@@ -548,6 +607,9 @@ class AmyloidEnv(gym.Env):
             "Δpol":          Δpol,
             "clash":         clash,
             "reward":        rew,
+            "reg_off":  reg,
+            "hb_err":   hb,
+            "rot_out":  rot,
         }
 
         # 7) Check truncation
