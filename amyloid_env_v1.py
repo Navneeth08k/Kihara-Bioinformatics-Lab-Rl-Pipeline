@@ -231,24 +231,40 @@ def replicate_chain(chain_struct, n_copy=3):
         copies.append(copy)
     return copies
 
+# ───────── correct χ1 outlier counter ─────────
 def rotamer_outliers(struct):
-    """χ1 only, Dunbrack thresholds ~±60°.  Returns integer count."""
+    """
+    Count χ1 rotamer outliers.
+    Uses N-CA-CB-X  dihedral, where X is CG/OG1/SG… depending on residue.
+    A value outside ±60° (gauche±) or 180° (trans) ± 20° is flagged.
+    """
+    # which fourth atom to use for each residue
+    chi1_atom = {
+        "SER": "OG",  "THR": "OG1", "CYS": "SG",
+        "ILE": "CG1", "VAL": "CG1",
+        # default CG for the rest
+    }
+
     out = 0
-    for residue in struct[0].get_residues():
-        if not is_aa(residue):
+    for res in struct[0].get_residues():
+        if not is_aa(res) or res.get_resname() in ("GLY",):  # no χ1
             continue
-        # need four atoms for χ1: N-CA-CB-CG (& analogues)
         try:
-            n, ca, cb, cg = (residue[a] for a in ("N", "CA", "CB", "CG"))
+            n  = res["N"].get_vector()
+            ca = res["CA"].get_vector()
+            cb = res["CB"].get_vector()
+            cg_name = chi1_atom.get(res.get_resname(), "CG")
+            cg = res[cg_name].get_vector()
         except KeyError:
-            continue
-        v1, v2, v3 = (ca.get_vector()-n.get_vector(),
-                      cb.get_vector()-ca.get_vector(),
-                      cg.get_vector()-cb.get_vector())
-        angle = calc_dihedral(v1, v2, v3) * 180/np.pi
-        if np.abs(angle) > 120:   # outside trans / gauche± windows
+            continue                   # missing atoms → skip
+
+        chi1 = calc_dihedral(n, ca, cb, cg) * 180.0 / np.pi   # radians→deg
+        # bring to −180…180 then test windows
+        chi1 = (chi1 + 180) % 360 - 180
+        if (abs(chi1) > 100) or (20 < abs(chi1) < 140):
             out += 1
     return out
+
 
 def assemble_models(models):
     """

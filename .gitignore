@@ -27944,3 +27944,4 @@ venv/Lib/site-packages/PeptideBuilder-1.1.0.dist-info/WHEEL
 __pycache__/rebuild_structure.cpython-310.pyc
 RLBetaAmyloidApproachv2.code-workspace
 RLBetaAmyloidApproachv2.code-workspace
+venv/Lib/site-packages/**/
