@@ -66,7 +66,7 @@ class MetricTBCallback(BaseCallback):
             "energy", "rmsd",
             "hyd_buried", "pol_buried", "total_buried",
             "Δhyd", "Δpol",
-            "clash", "reward",
+            "clash", "reward", "reg_off", "hb_err", "rot_out"
         ]
         acc = {k: [] for k in keys}
         for info in infos:
