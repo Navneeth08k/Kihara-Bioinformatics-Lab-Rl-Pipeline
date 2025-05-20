@@ -559,68 +559,65 @@ class AmyloidEnv(gym.Env):
 
     def step(self, action):
         """
-        Apply an action (delta φ/ψ), rebuild SASA/clash when needed, and return
+        Apply an action (delta φ/ψ), rebuild SASA/clash as needed, and return
         (obs, reward, done, trunc, info) under a 3-phase curriculum:
           1) 0–50k steps: burial shaping only
-          2) 50–150k: + register/RMSD & burial/H-bonds
-          3) >150k: + rotamer & clash penalties
+          2) 50–150k: +register/RMSD & burial/H-bonds
+          3) >150k: +rotamer & clash penalties
         """
-        # --- 1) bookkeeping & apply action ---
+        # 1) bookkeeping & apply action
         self.global_step  += 1
         self.current_step += 1
         self.state = apply_action(self.state, action)
         if self.global_step % self.sasa_period == 0:
             self._rebuild_trimer()
 
-        # --- 2) compute raw signals ---
-        E         = compute_energy(self.state)       # raw energy
-        E_scaled  = E / 1000.0
-        R         = compute_rmsd(self.state, self.target)  # raw RMSD
-        hS, pS    = compute_sasa_terms(self.state)
-        Δhyd      = self.state["hyd_buried"] - self.prev_hyd
-        Δpol      = self.prev_pol - self.state["pol_buried"]
-        reg_raw   = abs(self.state["reg_off"])
-        hb_raw    = self.state["hb_err"]
-        rot_raw   = self.state["rot_out"]
-        clash_raw = self.state["clash_ic"]
+        # 2) compute raw signals
+        E        = compute_energy(self.state)
+        R        = compute_rmsd(self.state, self.target)
+        hS, pS   = compute_sasa_terms(self.state)
+        Δhyd     = self.state["hyd_buried"] - self.prev_hyd
+        Δpol     = self.prev_pol - self.state["pol_buried"]
+        reg_raw  = abs(self.state["reg_off"])
+        hb_raw   = self.state["hb_err"]
+        rot_raw  = self.state["rot_out"]
+        clash_raw= self.state["clash_ic"]
 
         # update SASA baseline
-        self.prev_hS, self.prev_pS = hS, pS
         self.prev_hyd, self.prev_pol = self.state["hyd_buried"], self.state["pol_buried"]
 
-        # --- 3) normalize & clip ---
-        valid_len = max(self.state["valid_len"], 1)
-        reg_norm  = reg_raw / valid_len
-        hb_norm   = min(hb_raw / valid_len,  self.hb_cap_per_res)
-        rot_norm  = min(rot_raw / valid_len, self.rot_cap_per_res)
-        clash_norm= min(clash_raw / self.max_clash_ic, 1.0)
-        rmsd_norm = self.state["R_rmsd"] / 180.0
-        energy_norm = E_scaled / 10.0
+        # 3) normalize & clip
+        valid_len   = max(self.state["valid_len"], 1)
+        reg_norm    = reg_raw / valid_len
+        hb_norm     = min(hb_raw / valid_len,   self.hb_cap_per_res)
+        rot_norm    = min(rot_raw / valid_len,  self.rot_cap_per_res)
+        clash_norm  = min(clash_raw / self.max_clash_ic, 1.0)
+        rmsd_norm   = self.state["R_rmsd"] / 180.0
+        energy_norm = (E / 1000.0) / 10.0
 
-        # per-residue burial shaping
         dh_per_res = max(Δhyd, 0.0) / valid_len
         dp_per_res = max(Δpol, 0.0) / valid_len
 
-        # --- 4) curriculum‐aware reward ---
+        # 4) curriculum‐aware reward
         gs = self.global_step
         if gs < self.phase1_steps:
-            # Phase 1: only burial shaping
+            # Phase 1: burial shaping only
             rew = +0.10 * dh_per_res + 0.05 * dp_per_res
 
         elif gs < self.phase2_steps:
-            # Phase 2: add register/RMSD + H-bond/SASA penalties
+            # Phase 2: add register/RMSD & H-bond/SASA
             rew = (
                 +0.10 * dh_per_res
                 +0.05 * dp_per_res
                 -1.00 * reg_norm
                 -1.00 * hb_norm
-                -1.00 * clash_norm   # optional to include here
                 -1.00 * rmsd_norm
+                -1.00 * clash_norm    # optional here or in Phase 3
                 -0.10 * energy_norm
             )
 
         else:
-            # Phase 3: full quality penalties (including rotamers)
+            # Phase 3: full penalties (incl. rotamers)
             rew = (
                 +0.10 * dh_per_res
                 +0.05 * dp_per_res
@@ -632,12 +629,14 @@ class AmyloidEnv(gym.Env):
                 -0.10 * energy_norm
             )
 
-        # --- 5) build info dict (unchanged) ---
+        # 5) truncation & info dict
+        done  = False
+        trunc = (self.current_step >= self.max_steps)
         info = {
             "step":        self.current_step,
             "global_step": self.global_step,
             "energy":      E,
-            "rmsd":        None if self.i_mode else R,
+            "rmsd":        R,
             "hyd_buried":  self.state["hyd_buried"],
             "pol_buried":  self.state["pol_buried"],
             "reg_off":     self.state["reg_off"],
@@ -648,12 +647,19 @@ class AmyloidEnv(gym.Env):
             "Δpol":        Δpol,
             "reward":      rew,
         }
-
-        # 6) package obs and done flags as before
-        obs = self._make_observation()
-        done = (self.current_step >= self.max_steps)
-        return obs, rew, done, False, info
-
+        info.update({
+            "dh_per_res":   dh_per_res,
+            "dp_per_res":   dp_per_res,
+            "reg_norm":     reg_norm,
+            "hb_norm":      hb_norm,
+            "rot_norm":     rot_norm,
+            "clash_norm":   clash_norm,
+            "rmsd_norm":    rmsd_norm,
+            "energy_norm":  energy_norm,
+        })
+        # 6) build obs & return
+        obs = self._build_obs()
+        return obs, rew, done, trunc, info
     
 
 
